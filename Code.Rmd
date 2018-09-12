@@ -1,0 +1,553 @@
+---
+title: "Code (Thesis)"
+author: "Kanyao Han"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Packages
+```{r}
+library(knitr)
+library(rpart)
+library(glmnet)
+library(ranger)
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(modelr)
+library(gbm)
+library(ggmap)
+library(plotly)
+library(MACSS)
+library(kedd)
+```
+
+## Identifying home address
+```{r}
+# geospatial distance function
+
+earth.dist <- function (long1, lat1, long2, lat2){
+  rad <- pi/180
+  a1 <- lat1 * rad
+  a2 <- long1 * rad
+  b1 <- lat2 * rad
+  b2 <- long2 * rad
+  dlon <- b2 - a2
+  dlat <- b1 - a1
+  a <- (sin(dlat/2))^2 + cos(a1) * cos(b1) * (sin(dlon/2))^2
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  R <- 6378.145
+  d <- R * c
+  return(d)
+}
+
+
+# A function for cleaning and identifying address (apply to cars one by one)
+
+car_read <- function(x){
+  data1 <- fread(x, header = FALSE) %>%
+    select(V4, V7, V8, V9, V10) %>%
+    mutate(V9 = ymd(V9)) %>%
+    mutate(hours = hms(V10),
+           hours = hour(hours)) %>%
+    filter(hours >= 5) %>%
+    group_by(V9,V4) %>%
+    slice(1)
+  
+  while (nrow(data1) > 2){
+    data1 <- data1 %>%
+      group_by(V4) %>%
+      mutate(lon_mean = mean(V7),
+             lat_mean = mean(V8),
+             distance = earth.dist(V7, V8, mean(V7), mean(V8))) %>%
+      filter(distance != max(distance))
+  }
+  return(data1)
+}
+
+location <- list.files(pattern = "*.txt") %>%
+  map_df(~car_read(.))
+
+
+fil <- location %>%
+  group_by(V4) %>%
+  count() %>%
+  arrange(n) %>%
+  filter(n == 2)
+
+fil_index <- fil$V4
+
+location <- filter(location, V4 %in% fil_index)
+
+location1 <- location %>%
+  mutate(lon_mean = mean(V7),
+         lat_mean = mean(V8),
+         distance = earth.dist(V7, V8, mean(V7), mean(V8))) %>%
+  filter(distance <= 0.2) %>%
+  group_by(V4) %>%
+  slice(1)
+
+
+# process example
+mlon_vec <- NA
+mlat_vec <- NA
+while (nrow(example) > 2){
+  mean_lon <- mean(example$V7)
+  mean_lat <- mean(example$V8)
+  example <- example %>%
+    mutate(lon_mean = mean(V7),
+           lat_mean = mean(V8),
+           distance = earth.dist(V7, V8, mean(V7), mean(V8))) %>%
+    filter(distance != max(distance))
+  
+  mlon_vec <- c(mlon_vec, mean_lon)
+  mlat_vec <- vecc(mlat_vec, mean_lat)
+}
+
+center <- data.frame(mlon_vec[-1], mlat_vec[-1])
+```
+
+
+## Merging data
+```{r}
+car <- read_csv("./Latent.csv") %>%
+  filter(choiceID == 1)
+
+claim <- read_csv("./claim.csv")
+owner <- read_csv("./owner.csv")
+a <- full_join(claim, owner, by = "ConfirmSequenceNo") %>%
+  select(VIN, ClaimAmount, ClaimType)
+
+
+location5 <- location1 %>%
+  mutate(South = if_else(V7 > 116.30 & V7 < 116.49
+                         & V8 > 39.7 & V8 < 39.9, 
+                         1, 0)) %>%
+  mutate(bj = if_else(V7 > 115.7 & V7 < 117.4
+                         & V8 > 39.4 & V8 < 41.6, 
+                         1, 0)) %>%
+  mutate(Haidian = if_else(V7 > 116.28 & V7 < 116.37
+                         & V8 > 39.94 & V8 < 39.99, 
+                         1, 0)) %>%
+  mutate(H_T = if_else(V7 > 116.27 & V7 < 116.5
+                         & V8 > 40.02 & V8 < 40.1, 
+                         1, 0)) %>%
+  select(-V7, -V8) %>%
+  rename("VIN" = V4)
+
+car1 <- car %>%
+  inner_join(location5) %>%
+  inner_join(a) %>%
+  group_by(VIN) %>%
+  arrange(desc(ClaimAmount)) %>%
+  slice(1) %>%
+  mutate(ClaimAmount = if_else(is.na(ClaimAmount), 0, ClaimAmount),
+         ClaimAmount = if_else(claim == 0, 0, ClaimAmount)) %>%
+  select(-ClaimType) %>%
+  drop_na() %>%
+  select(- hours, - lon_mean, - lat_mean, -V9, -V10, - distance, -bj) %>%
+  rename("North_residence" = H_T)
+```
+
+## Distribution
+```{r}
+bj <- get_map(location = "Beijing", zoom = 10)
+
+car2 <- car1 %>%
+  mutate(Accident = if_else(claim == 0, "No", "Yes"),
+         Accident = factor(Accident, level = c("No", "Yes")))
+
+ggmap(bj) +
+  geom_point(data = car2, aes(lon_mean, lat_mean, color = Accident),
+             size = 0.5, alpha = 0.5) +
+  geom_point(data = filter(car2, Accident == "Yes"), aes(lon_mean, lat_mean), 
+             color = "red", size = 0.5)
+
+
+car3 <- car1 %>%
+  filter(lon_mean > 116 & lon_mean < 116.9,
+         lat_mean > 39.5 & lat_mean < 40.4)
+car4 <- filter(car3, claim == 1)
+
+den3d <- kde2d(car3$lon_mean, car3$lat_mean, h = opt)
+den3d1 <- kde2d(car4$lon_mean, car4$lat_mean, h = opt)
+
+plot_ly(x=den3d$x, y=den3d$y, z=den3d$z) %>% add_surface()
+plot_ly(x=den3d$x, y=den3d$y, z=den3d$z) %>% add_contour()
+plot_ly(x=den3d1$x, y=den3d1$y, z=den3d1$z) %>% add_surface()
+plot_ly(x=den3d1$x, y=den3d1$y, z=den3d1$z) %>% add_contour()
+```
+
+## Logistic regression
+```{r}
+car1 <- read.csv("car1.csv")
+car1 <- car1[, -c(1,13,36, 37, 39)]
+
+lg1 <- glm(data = car1, as.factor(claim)~. - f3 - f2 - f1 -PCT_DAYTIME-YOUNG - OLD -ClaimAmount 
+           -claim-asc-choiceID-id-set - VIN-PCT_SPEED45-PCT_WKD, family = binomial)
+summary(lg1)
+
+steplg <- stepAIC(lg1)
+summary(steplg)
+lg2 <- glm(data = car1, claim~ FEMALE + AGE + STATE_JOB + INTERNET_SALE + ANNUAL_MIL +
+             CAR_PRICE + NEW_CAR + Bigcar + AIRBAG + ALARM , family = binomial)
+summary(lg2)
+
+
+library(epicalc)
+install.packages("epicalc")
+lg3 <- glm(data = car1, claim~ INTERNET_SALE + ANNUAL_MIL +
+             NEW_CAR + HARD_BRK + PCT_NIGHT + MEAN_FMLRT + South + Haidian + H_T , family = binomial)
+summary(lg3)
+summary(anova(steplg, lg1))
+
+
+lrt <- function (obj1, obj2) {
+  L0 <- logLik(obj1)
+  L1 <- logLik(obj2)
+  L01 <- as.vector(- 2 * (L0 - L1))
+  df <- abs(attr(L1, "df") - attr(L0, "df"))
+  list(L01 = L01, df = df,
+     "p-value" = pchisq(L01, df, lower.tail = FALSE))}
+logLik(lg1)
+
+
+pchisq(-47.55356, 12, lower.tail = FALSE)
+lrt(lg2, lg3)
+```
+
+
+## Spliting data
+```{r}
+car1 <- read.csv("data3.csv")
+set.seed(2001)
+
+dsplit <- resample_partition(car1, c(test = 0.3, train = 0.7))
+
+test <- car1 %>%
+  filter(id %in% dsplit$test$idx)
+
+train <- car1 %>%
+  filter(id %in% dsplit$train$idx)
+```
+
+## Decision tree
+```{r}
+tr <- rpart(ClaimAmount ~ .-claim-asc-choiceID-id-set - VIN -YOUNG - OLD - 
+              PCT_SPEED45 - PCT_DAYTIME -
+              f1 - f2 - f3, data=train)
+
+
+par(xpd = NA, mar = rep(0.7, 4)) 
+plot(tr, uniform=TRUE)
+text(tr, use.n=FALSE, fancy = FALSE, all=TRUE, cex=.8)
+```
+
+
+## Gradient boosting
+```{r}
+# GPS + insurance
+
+mse <- function(model, data) {
+  x <- modelr:::residuals(model, data)
+  mean(x ^ 2, na.rm = TRUE)
+}
+
+set.seed(2001)
+model <- gbm(formula = ClaimAmount ~ .-claim-asc-choiceID-id-set - VIN -YOUNG - OLD - 
+               PCT_SPEED45 - PCT_DAYTIME -f1 - f2 - f3 , 
+             distribution = "gaussian", data = train, n.trees = 2000, 
+             interaction.depth = 4, shrinkage = 0.001, cv.folds = 10)
+
+n.trees = seq(from=10 ,to=2000, by=10)
+
+predmatrix<-predict(model,test,n.trees = n.trees)
+dim(predmatrix)
+
+test.error = NA
+for (i in 1:200){
+  test.error[i] <- mean((predmatrix[,i]- test$ClaimAmount)^2)
+}
+
+boo <- min(test.error)
+arrange(data.frame(test.error, c(1:200)), test.error) 
+head(test.error)
+
+plot(n.trees , test.error , pch=19,col="blue",xlab="Number of Trees",
+     ylab="Test Error", main = "Perfomance of Boosting on Test Set")
+
+# model results
+cccc <- summary(model)
+
+
+# Insurance-based
+set.seed(2001)
+model1 <- gbm(formula = ClaimAmount ~ FEMALE + AGE + STATE_JOB + 
+                INTERNET_SALE + ANNUAL_MIL + CAR_PRICE + 
+                NEW_CAR + Bigcar + AIRBAG + ALARM, 
+              distribution = "gaussian", data = train, n.trees = 2000, 
+              interaction.depth = 4, shrinkage = 0.001)
+
+predmatrix1<-predict(model1,test,n.trees = n.trees)
+dim(predmatrix)
+
+test.error1 = NA
+for (i in 1:200){
+  test.error1[i] <- mean((predmatrix1[,i]- test$ClaimAmount)^2)
+}
+
+boo1 <- min(test.error1)
+
+head(test.error1)
+
+plot(n.trees , test.error1 , pch=19,col="blue",xlab="Number of Trees",
+     ylab="Test Error", main = "Perfomance of Boosting on Test Set")
+```
+
+## Random Forest
+```{r}
+# GPS + insruance
+
+set.seed(2001)
+fit.forest = ranger(ClaimAmount ~ .-claim-asc-choiceID-id-set - 
+                      VIN -YOUNG -OLD - PCT_SPEED45 - 
+                      PCT_DAYTIME -f1 - f2 - f3, data=train, 
+                    num.trees = 2000, importance="permutation", verbose=T)
+
+summary(fit.forest)
+fit.forest$variable.importance
+
+arrange(data.frame(fit.forest$variable.importance), 
+        desc(fit.forest.variable.importance))
+
+
+fore <- mean((test$ClaimAmount - predict(fit.forest, test)$prediction)^2)
+
+
+# Insurance-based
+
+set.seed(2001)
+fit.forest1 = ranger(ClaimAmount ~ FEMALE + AGE + STATE_JOB + INTERNET_SALE + 
+                       ANNUAL_MIL + CAR_PRICE + NEW_CAR + Bigcar + 
+                       AIRBAG + ALARM, data=train, num.trees = 2000, 
+                     importance="impurity", verbose=T)
+
+summary(fit.forest)
+fit.forest1$variable.importance
+
+fore1 <- mean((test$ClaimAmount - predict(fit.forest1, test)$prediction)^2)
+```
+
+## Lasso
+```{r}
+# Insurance-based
+
+set.seed(2001)
+
+train.x1 <- model.matrix(ClaimAmount ~ FEMALE + AGE + STATE_JOB + 
+                           INTERNET_SALE + ANNUAL_MIL + CAR_PRICE + 
+                           NEW_CAR + Bigcar + AIRBAG + ALARM-
+                           f1 - f2 - f3, data =train)
+
+train.y1 <- train$ClaimAmount
+
+test.x1 <- model.matrix(ClaimAmount ~ FEMALE + AGE + STATE_JOB + 
+                          INTERNET_SALE + ANNUAL_MIL + CAR_PRICE + NEW_CAR + 
+                          Bigcar + AIRBAG + ALARM-f1 - f2 - f3, data = test)
+
+test.y1 <- test$ClaimAmount
+
+cv.lasso1 = cv.glmnet(train.x1, train.y1, alpha = 1.0)
+
+fit_lasso1 = as.numeric(coef(cv.lasso1, s = "lambda.min"))
+
+pred_lasso1 =predict(cv.lasso1, newx = as.matrix(test.x1),s = "lambda.min")
+
+mse_lasso1 = mean((test.y1 - pred_lasso1)^2)
+
+
+# GPS + Insurance
+
+set.seed(2001)
+
+train.x <- model.matrix(ClaimAmount ~ . -claim-asc-choiceID-id-set - VIN -YOUNG - OLD - 
+                          PCT_SPEED45 - PCT_DAYTIME -f1 - f2 - f3, data =train)
+
+train.y <- train$ClaimAmount
+
+test.x <- model.matrix(ClaimAmount ~ . -claim-asc-choiceID-id-set - 
+                         VIN -YOUNG - OLD - PCT_SPEED45 - PCT_DAYTIME -
+                         f1 - f2 - f3, data = test)
+
+test.y <- test$ClaimAmount
+
+cv.lasso = cv.glmnet(train.x, train.y, alpha = 1.0)
+
+fit_lasso = as.numeric(coef(cv.lasso, s = "lambda.min"))
+
+pred_lasso =predict(cv.lasso, newx = as.matrix(test.x),s = "lambda.min")
+
+mse_lasso = mean((test.y - pred_lasso)^2)
+```
+
+
+## Elastic net
+```{r}
+# GPS + Insurance
+
+set.seed(2001)
+
+alpha_seq =seq(0, 1, by = 0.05)
+
+L =length(alpha_seq)
+
+rmse_DT = data.table(alpha = alpha_seq,
+                     mean_cv_error = rep(0, L))
+
+folds = sample(1:10, nrow(train), replace = TRUE)
+
+for(i in 1:L) {
+  cv_i = cv.glmnet(x = train.x, y = train.y, 
+                   alpha = rmse_DT[i, alpha], foldid = folds)
+  
+  rmse_DT[i, mean_cv_error:= min(cv_i$cvm)]
+}
+
+index_min = which.min(rmse_DT$mean_cv_error)
+opt_alpha = rmse_DT[index_min, alpha]
+
+fit_elnet = cv.glmnet(x = train.x, y = train.y, alpha = opt_alpha)
+
+coef_elnet = as.numeric(coef(fit_elnet, s = "lambda.min"))
+  
+pred_elnet =predict(fit_elnet, newx = as.matrix(test.x),s = "lambda.min")
+
+mse_elnet = mean((test.y - pred_elnet)^2)
+
+
+# GPS + Insurance
+
+set.seed(2001)
+
+rmse_DT = data.table(alpha = alpha_seq,
+                     mean_cv_error = rep(0, L))
+
+folds = sample(1:10, nrow(train), replace = TRUE)
+
+for(i in 1:L) {
+  cv_i = cv.glmnet(x = train.x1, y = train.y1, 
+                   alpha = rmse_DT[i, alpha], foldid = folds)
+  
+  rmse_DT[i, mean_cv_error:= min(cv_i$cvm)]
+}
+
+index_min = which.min(rmse_DT$mean_cv_error)
+opt_alpha = rmse_DT[index_min, alpha]
+
+fit_elnet1 = cv.glmnet(x = train.x1, y = train.y1, alpha = opt_alpha)
+
+coef_elnet1 = as.numeric(coef(fit_elnet1, s = "lambda.min"))
+  
+pred_elnet1 =predict(fit_elnet1, newx = as.matrix(test.x1),s = "lambda.min")
+
+mse_elnet1 = mean((test.y1 - pred_elnet1)^2)
+```
+
+## RMSE
+```{r}
+# RMSE
+
+a <- data.frame(boo,fore, mse_lasso, mse_elnet, coo) %>%
+  rename("Gradient boosting" = boo, "Random forest" = fore,
+         "Lasso" = mse_lasso, "Elastic net" = mse_elnet, "coo" = coo) %>%
+  gather(1:5, key = Model, value = mse)
+
+
+b <- data.frame(boo1, fore1, mse_lasso1, mse_elnet1, coo1) %>%
+  rename("Gradient boosting" = boo1, "Random forest" = fore1,
+         "Lasso" = mse_lasso1, "Elastic net" = mse_elnet1, "coo1" = coo1) %>%
+  gather(1:5, key = Model, value = mse)
+
+c <- bind_rows("Insurance based" = b, "GPS + Insurance" = a, .id = "Features")
+c$Model = factor(c$Model, level = c("Gradient boosting", "Lasso", "Elastic net", "Random forest"))
+
+ggplot(c, aes(Model, sqrt(mse))) +
+  geom_point(aes(color = Features)) +
+  geom_line(aes(as.numeric(Model), sqrt(mse), color = Features)) +
+  theme_bw() +
+  theme(legend.position="bottom") +
+  labs(title = "Figure 4: Performance of four models with different features",
+       y = "Root of mean squared error",
+       subtitle = "The response is claim loss (measured by RMB)")
+```
+
+## Feature Importance
+```{r, fig.width = 5, fig.height=5}
+# Gradient boosting tree
+
+cccc <- summary(model)
+
+cccc$var <- ifelse(cccc$var == "PCT_SPEED123", "PCT_SPEED123", cccc$var)
+
+cccc$var <- rownames(cccc)
+cccc %>% 
+  head(10) %>%
+  rename("Features" = var, "Relative Influence" = rel.inf) %>%
+  mutate(Features = factor(Features, level = c('ANNUAL_MIL', 'PCT_URBAN', 'PCT_LOCAL',
+                                               'PCT_FREEWAY', 'HARD_ACCL', 'PCT_NIGHT',
+                                               'CAR_PRICE', 'HARD_BRK', 'AGE', 'MEAN_FMLRT'),
+                           labels = c('ANNUAL_MIL', 'PCT_URBAN', 'PCT_LOCAL',
+                                               'PCT_FREEWAY', 'HARD_ACCL', 'PCT_NIGHT',
+                                               'CAR_PRICE', 'HARD_BRK', 'AGE', 'MEAN_FMLRT'))) %>%
+  ggplot(aes(Features, `Relative Influence`)) +
+  geom_col(fill = "sky blue") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5))
+
+
+# Random Forest
+
+imp <- arrange(data.frame(fit.forest$variable.importance), 
+               desc(fit.forest.variable.importance)) %>%
+  head(10)
+fit.forest$variable.importance
+imp
+bbbbb <- c("PCT_WKD", "PCT_WEEKEND",                              "PCT_FREEWAY", "PCT_URBAN", 
+                                               "PCT_LOCAL", "ANNUAL_MIL", "HARD_BRK", 
+                                               "PCT_NIGHT", 
+                                               "PCT_SPEED", "CAR_PRICE")
+
+cbind(bbbbb, imp) %>%
+  rename("Importance" = fit.forest.variable.importance,
+         "Features" = bbbbb) %>%
+  mutate(Features = factor(Features, level = c("PCT_WKD", "PCT_WEEKEND", 
+                                               "PCT_FREEWAY", "PCT_URBAN", 
+                                               "PCT_LOCAL", "ANNUAL_MIL", "HARD_BRK", 
+                                               "PCT_NIGHT", 
+                                               "PCT_SPEED", "CAR_PRICE"))) %>%
+  ggplot(aes(Features, Importance / 1000000)) +
+  geom_col(fill = "sky blue") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5))
+```
+
+# Coefficients (lasso and elastic net)
+```{r}
+Features <- row.names(coef(cv.lasso, s = "lambda.min"))
+Features[10] <- "BIG_CAR"
+Features[20] <- "PCT_SPEED"
+
+ccc <- data.frame(Features, fit_lasso, coef_elnet)[-2,] %>%
+  rename("Lasso" = fit_lasso, "Elastic net" = coef_elnet) %>%
+  kable()
+
+
+save(ccc, file = "ccc.RData")
+```
+
+
